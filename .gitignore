@@ -111,4 +111,4 @@ venv.bak/
 config/api_keys.json
 memory/
 cache/
-temp/*.*
+temp/
