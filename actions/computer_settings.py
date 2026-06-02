@@ -1,4 +1,5 @@
 #computer_settings.py
+import ctypes
 import json
 import re
 import sys
@@ -22,6 +23,298 @@ except ImportError:
     _PYPERCLIP = False
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
+
+_AUDIO_OUTPUT_UNSUPPORTED = "Audio output switching is currently supported on macOS only."
+
+
+def _fourcc(code: str) -> int:
+    return int.from_bytes(code.encode("ascii"), "big")
+
+
+class _AudioObjectPropertyAddress(ctypes.Structure):
+    _fields_ = [
+        ("mSelector", ctypes.c_uint32),
+        ("mScope", ctypes.c_uint32),
+        ("mElement", ctypes.c_uint32),
+    ]
+
+
+_K_AUDIO_OBJECT_SYSTEM_OBJECT = 1
+_K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL = _fourcc("glob")
+_K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT = _fourcc("outp")
+_K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN = 0
+_K_AUDIO_HARDWARE_PROPERTY_DEVICES = _fourcc("dev#")
+_K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE = _fourcc("dOut")
+_K_AUDIO_HARDWARE_PROPERTY_DEFAULT_SYSTEM_OUTPUT_DEVICE = _fourcc("sOut")
+_K_AUDIO_DEVICE_PROPERTY_STREAMS = _fourcc("stm#")
+_K_AUDIO_OBJECT_PROPERTY_NAME = _fourcc("lnam")
+_K_CFSTRING_ENCODING_UTF8 = 0x08000100
+
+
+def _core_audio():
+    return ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+
+
+def _core_foundation():
+    return ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+
+
+def _audio_address(selector: int, scope: int = _K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL):
+    return _AudioObjectPropertyAddress(
+        selector,
+        scope,
+        _K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    )
+
+
+def _check_osstatus(status: int, operation: str):
+    if status != 0:
+        raise RuntimeError(f"{operation} failed with OSStatus {status}")
+
+
+def _audio_get_property_data_size(object_id: int, address: _AudioObjectPropertyAddress) -> int:
+    size = ctypes.c_uint32(0)
+    status = _core_audio().AudioObjectGetPropertyDataSize(
+        ctypes.c_uint32(object_id),
+        ctypes.byref(address),
+        ctypes.c_uint32(0),
+        None,
+        ctypes.byref(size),
+    )
+    _check_osstatus(status, "AudioObjectGetPropertyDataSize")
+    return size.value
+
+
+def _audio_get_property_data(object_id: int, address: _AudioObjectPropertyAddress, data, size: int):
+    data_size = ctypes.c_uint32(size)
+    status = _core_audio().AudioObjectGetPropertyData(
+        ctypes.c_uint32(object_id),
+        ctypes.byref(address),
+        ctypes.c_uint32(0),
+        None,
+        ctypes.byref(data_size),
+        ctypes.byref(data),
+    )
+    _check_osstatus(status, "AudioObjectGetPropertyData")
+    return data_size.value
+
+
+def _audio_set_property_data(object_id: int, address: _AudioObjectPropertyAddress, data, size: int):
+    status = _core_audio().AudioObjectSetPropertyData(
+        ctypes.c_uint32(object_id),
+        ctypes.byref(address),
+        ctypes.c_uint32(0),
+        None,
+        ctypes.c_uint32(size),
+        ctypes.byref(data),
+    )
+    _check_osstatus(status, "AudioObjectSetPropertyData")
+
+
+def _cfstring_to_str(cf_string) -> str:
+    if not cf_string:
+        return ""
+    cf = _core_foundation()
+    cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
+    cf.CFStringGetLength.restype = ctypes.c_long
+    cf.CFStringGetMaximumSizeForEncoding.argtypes = [ctypes.c_long, ctypes.c_uint32]
+    cf.CFStringGetMaximumSizeForEncoding.restype = ctypes.c_long
+    cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFRelease.restype = None
+
+    length = cf.CFStringGetLength(cf_string)
+    max_size = cf.CFStringGetMaximumSizeForEncoding(length, _K_CFSTRING_ENCODING_UTF8) + 1
+    buffer = ctypes.create_string_buffer(max_size)
+    try:
+        if cf.CFStringGetCString(cf_string, buffer, max_size, _K_CFSTRING_ENCODING_UTF8):
+            return buffer.value.decode("utf-8", errors="replace")
+        return ""
+    finally:
+        cf.CFRelease(cf_string)
+
+
+def _macos_audio_device_name(device_id: int) -> str:
+    cf_string = ctypes.c_void_p()
+    address = _audio_address(_K_AUDIO_OBJECT_PROPERTY_NAME)
+    _audio_get_property_data(device_id, address, cf_string, ctypes.sizeof(cf_string))
+    return _cfstring_to_str(cf_string)
+
+
+def _macos_default_audio_device(selector: int) -> int:
+    device_id = ctypes.c_uint32(0)
+    address = _audio_address(selector)
+    _audio_get_property_data(
+        _K_AUDIO_OBJECT_SYSTEM_OBJECT,
+        address,
+        device_id,
+        ctypes.sizeof(device_id),
+    )
+    return int(device_id.value)
+
+
+def _macos_audio_output_devices() -> list[dict]:
+    devices_address = _audio_address(_K_AUDIO_HARDWARE_PROPERTY_DEVICES)
+    devices_size = _audio_get_property_data_size(_K_AUDIO_OBJECT_SYSTEM_OBJECT, devices_address)
+    device_count = devices_size // ctypes.sizeof(ctypes.c_uint32)
+    if device_count <= 0:
+        return []
+
+    device_ids = (ctypes.c_uint32 * device_count)()
+    _audio_get_property_data(
+        _K_AUDIO_OBJECT_SYSTEM_OBJECT,
+        devices_address,
+        device_ids,
+        devices_size,
+    )
+
+    default_output = _macos_default_audio_device(_K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE)
+    default_system = _macos_default_audio_device(_K_AUDIO_HARDWARE_PROPERTY_DEFAULT_SYSTEM_OUTPUT_DEVICE)
+    output_devices = []
+
+    for device_id in device_ids:
+        stream_address = _audio_address(
+            _K_AUDIO_DEVICE_PROPERTY_STREAMS,
+            _K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+        )
+        try:
+            stream_size = _audio_get_property_data_size(int(device_id), stream_address)
+        except Exception:
+            continue
+        if stream_size <= 0:
+            continue
+
+        name = _macos_audio_device_name(int(device_id)).strip()
+        if not name:
+            name = f"Audio Device {int(device_id)}"
+        output_devices.append({
+            "id": int(device_id),
+            "name": name,
+            "is_default_output": int(device_id) == default_output,
+            "is_default_system": int(device_id) == default_system,
+        })
+
+    return output_devices
+
+
+def _normalize_audio_device_name(text: str) -> str:
+    return re.sub(r"[\s_\-()\[\]{}<>:：,，.。/\\]+", "", str(text).casefold())
+
+
+def _audio_device_candidates_for_alias(target: str, devices: list[dict]) -> list[dict]:
+    normalized_target = _normalize_audio_device_name(target)
+    speaker_aliases = {
+        "speaker", "speakers", "builtin", "builtinspeaker", "builtinspeakers",
+        "internal", "internalspeaker", "internalspeakers", "本机扬声器", "内置扬声器",
+    }
+    headphone_aliases = {
+        "headphone", "headphones", "earphone", "earphones", "headset", "耳机", "外置耳机",
+    }
+
+    if normalized_target in speaker_aliases:
+        tokens = ("speaker", "speakers", "扬声器")
+    elif normalized_target in headphone_aliases:
+        tokens = ("headphone", "headphones", "earphone", "earphones", "headset", "耳机")
+    else:
+        return []
+
+    matches = []
+    for device in devices:
+        normalized_name = _normalize_audio_device_name(device["name"])
+        if any(token in normalized_name for token in tokens):
+            matches.append(device)
+    return matches
+
+
+def _match_audio_output_devices(devices: list[dict], target: str) -> list[dict]:
+    normalized_target = _normalize_audio_device_name(target)
+    if not normalized_target:
+        return []
+
+    exact = [d for d in devices if d["name"] == target]
+    if exact:
+        return exact
+
+    normalized_exact = [
+        d for d in devices
+        if _normalize_audio_device_name(d["name"]) == normalized_target
+    ]
+    if normalized_exact:
+        return normalized_exact
+
+    alias_matches = _audio_device_candidates_for_alias(target, devices)
+    if alias_matches:
+        return alias_matches
+
+    return [
+        d for d in devices
+        if normalized_target in _normalize_audio_device_name(d["name"])
+        or _normalize_audio_device_name(d["name"]) in normalized_target
+    ]
+
+
+def _format_audio_output_devices(devices: list[dict]) -> str:
+    if not devices:
+        return "No audio output devices found."
+    lines = ["Audio output devices:"]
+    for device in devices:
+        markers = []
+        if device.get("is_default_output"):
+            markers.append("current output")
+        if device.get("is_default_system"):
+            markers.append("system sounds")
+        suffix = f" ({', '.join(markers)})" if markers else ""
+        lines.append(f"- {device['name']}{suffix}")
+    return "\n".join(lines)
+
+
+def list_audio_outputs() -> str:
+    if _OS != "Darwin":
+        return _AUDIO_OUTPUT_UNSUPPORTED
+    try:
+        return _format_audio_output_devices(_macos_audio_output_devices())
+    except Exception as e:
+        print(f"[Settings] list_audio_outputs failed: {e}")
+        return f"Could not list audio output devices: {e}"
+
+
+def switch_audio_output(target: str) -> str:
+    if _OS != "Darwin":
+        return _AUDIO_OUTPUT_UNSUPPORTED
+
+    target = str(target or "").strip()
+    if not target:
+        return "No audio output device specified.\n" + list_audio_outputs()
+
+    try:
+        devices = _macos_audio_output_devices()
+        matches = _match_audio_output_devices(devices, target)
+        if not matches:
+            return (
+                f"Could not find audio output device matching '{target}'.\n"
+                + _format_audio_output_devices(devices)
+            )
+        if len(matches) > 1:
+            names = ", ".join(device["name"] for device in matches)
+            return f"Multiple audio output devices match '{target}': {names}. Please use the exact device name."
+
+        device = matches[0]
+        device_id = ctypes.c_uint32(device["id"])
+        for selector in (
+            _K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE,
+            _K_AUDIO_HARDWARE_PROPERTY_DEFAULT_SYSTEM_OUTPUT_DEVICE,
+        ):
+            _audio_set_property_data(
+                _K_AUDIO_OBJECT_SYSTEM_OBJECT,
+                _audio_address(selector),
+                device_id,
+                ctypes.sizeof(device_id),
+            )
+        return f"Audio output switched to {device['name']}."
+    except Exception as e:
+        print(f"[Settings] switch_audio_output failed: {e}")
+        return f"Could not switch audio output: {e}"
 
 
 def _get_base_dir() -> Path:
@@ -575,7 +868,7 @@ def _detect_action(description: str) -> dict:
     model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
     available = ", ".join(sorted(ACTION_MAP.keys())) + \
-                ", volume_set, type_text, press_key, reload_n"
+                ", volume_set, type_text, press_key, reload_n, list_audio_outputs, switch_audio_output"
 
     prompt = f"""You are an intent detector for a computer control assistant.
 
@@ -592,6 +885,8 @@ Rules:
 - For type_text: value is the exact text to type.
 - For press_key: value is the key name (e.g. "f5", "tab", "enter").
 - For reload_n: value is an integer (number of times to reload).
+- For list_audio_outputs: value is null.
+- For switch_audio_output: value is the audio output device name or alias, e.g. "Mac mini扬声器", "外置耳机", "speaker", "headphones".
 - If no clear match, pick the closest action.
 - Return ONLY the JSON, no explanation, no markdown."""
 
@@ -609,9 +904,6 @@ def computer_settings(
     player=None,
     session_memory=None,
 ) -> str:
-    if not _PYAUTOGUI:
-        return "pyautogui is not installed. Run: pip install pyautogui"
-
     params      = parameters or {}
     raw_action  = params.get("action", "").strip()
     description = params.get("description", "").strip()
@@ -627,6 +919,9 @@ def computer_settings(
 
     if not action:
         return "No action could be determined."
+
+    if not _PYAUTOGUI and action not in ("list_audio_outputs", "switch_audio_output"):
+        return "pyautogui is not installed. Run: pip install pyautogui"
 
     print(f"[Settings] Action: {action}  Value: {value}  OS: {_OS}")
     if player:
@@ -646,6 +941,13 @@ def computer_settings(
             return f"Volume set to {value}%."
         except Exception as e:
             return f"Could not set volume: {e}"
+
+    if action in ("list_audio_outputs", "audio_outputs", "list_sound_outputs"):
+        return list_audio_outputs()
+
+    if action in ("switch_audio_output", "set_audio_output", "switch_sound_output"):
+        target = value or params.get("device") or params.get("name") or params.get("target")
+        return switch_audio_output(target)
 
     if action in ("type_text", "write_on_screen", "type", "write"):
         text = str(value or params.get("text", "")).strip()
