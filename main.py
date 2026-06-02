@@ -587,6 +587,8 @@ class JarvisLive:
         self._music_sleep_requested = False
         self._wake_after_music = False
         self._music_sleep_started_at = 0.0
+        self._audio_output_refresh_requested = False
+        self._preferred_audio_output_name = None
         self._startup_audio_buffer = []
         self._pending_text_commands: list[str] = []
         self._pending_text_lock = threading.Lock()
@@ -825,6 +827,79 @@ class JarvisLive:
         finally:
             self.set_speaking(False)
 
+    def _request_audio_output_refresh(self, device_name: str | None = None):
+        if device_name:
+            self._preferred_audio_output_name = device_name
+        self._audio_output_refresh_requested = True
+        self.ui.write_log("SYS: Audio output changed. Refreshing playback stream.")
+
+    def _normalize_audio_output_name(self, text: str) -> str:
+        return re.sub(r"[\s_\-()\[\]{}<>:：,，.。/\\]+", "", str(text).casefold())
+
+    def _resolve_sounddevice_output_device(self, device_name: str | None):
+        if not device_name:
+            return None
+        try:
+            devices = sd.query_devices()
+        except Exception as e:
+            print(f"[JARVIS] Could not query sound devices: {e}")
+            return None
+
+        target = self._normalize_audio_output_name(device_name)
+        output_matches = []
+        for index, device in enumerate(devices):
+            if int(device.get("max_output_channels", 0) or 0) <= 0:
+                continue
+            name = str(device.get("name", ""))
+            normalized_name = self._normalize_audio_output_name(name)
+            if normalized_name == target:
+                return index
+            if target and (target in normalized_name or normalized_name in target):
+                output_matches.append(index)
+        return output_matches[0] if len(output_matches) == 1 else None
+
+    def _consume_audio_output_refresh_request(self) -> bool:
+        if not self._audio_output_refresh_requested:
+            return False
+        self._audio_output_refresh_requested = False
+        return True
+
+    def _open_audio_output_stream(self):
+        device = self._resolve_sounddevice_output_device(self._preferred_audio_output_name)
+        try:
+            stream = sd.RawOutputStream(
+                device=device,
+                samplerate=RECEIVE_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=CHUNK_SIZE,
+            )
+        except Exception:
+            if device is None:
+                raise
+            print("[JARVIS] Preferred output device failed; falling back to system default")
+            stream = sd.RawOutputStream(
+                samplerate=RECEIVE_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=CHUNK_SIZE,
+            )
+        stream.start()
+        return stream
+
+    def _close_audio_output_stream(self, stream):
+        if not stream:
+            return
+        with contextlib.suppress(Exception):
+            stream.stop()
+        with contextlib.suppress(Exception):
+            stream.close()
+
+    async def _refresh_audio_output_stream(self, stream):
+        print("[JARVIS] 🔁 Refreshing audio output stream")
+        await asyncio.to_thread(self._close_audio_output_stream, stream)
+        return await asyncio.to_thread(self._open_audio_output_stream)
+
     def _enqueue_wake_audio(self, data: bytes):
         if not self._wake_audio_queue:
             return
@@ -976,6 +1051,9 @@ class JarvisLive:
             elif name == "computer_settings":
                 r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
                 result = r or "Done."
+                if isinstance(r, str) and r.startswith("Audio output switched to "):
+                    device_name = r.removeprefix("Audio output switched to ").rstrip(".")
+                    self._request_audio_output_refresh(device_name)
 
             elif name == "desktop_control":
                 r = await loop.run_in_executor(None, lambda: desktop_control(parameters=args, player=self.ui))
@@ -1198,22 +1276,21 @@ class JarvisLive:
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
 
-        stream = sd.RawOutputStream(
-            samplerate=RECEIVE_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-        )
-        stream.start()
+        stream = await asyncio.to_thread(self._open_audio_output_stream)
 
         try:
             while True:
+                if self._consume_audio_output_refresh_request():
+                    stream = await self._refresh_audio_output_stream(stream)
+
                 try:
                     chunk = await asyncio.wait_for(
                         self.audio_in_queue.get(),
                         timeout=0.1
                     )
                 except asyncio.TimeoutError:
+                    if self._consume_audio_output_refresh_request():
+                        stream = await self._refresh_audio_output_stream(stream)
                     if (
                         self._turn_done_event
                         and self._turn_done_event.is_set()
@@ -1224,6 +1301,8 @@ class JarvisLive:
                         if self._sleep_after_turn and self._sleep_event:
                             self._sleep_event.set()
                     continue
+                if self._consume_audio_output_refresh_request():
+                    stream = await self._refresh_audio_output_stream(stream)
                 audio_is_silent = _is_silent_pcm16(chunk)
                 if audio_is_silent:
                     self.set_speaking(False)
@@ -1236,8 +1315,7 @@ class JarvisLive:
             raise
         finally:
             self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            await asyncio.to_thread(self._close_audio_output_stream, stream)
 
     async def _run_conversation(self, client):
         print("[JARVIS] 🔌 Connecting...")
