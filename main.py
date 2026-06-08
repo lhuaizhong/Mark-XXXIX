@@ -8,6 +8,7 @@ import threading
 import json
 import sys
 import traceback
+import time
 from pathlib import Path
 
 import sounddevice as sd
@@ -57,6 +58,7 @@ CHUNK_SIZE          = 1024
 DEFAULT_CONVERSATION_IDLE_SLEEP_SECONDS = 60
 DEFAULT_WAKE_WORD_MODEL = "models/ahh_niu__ahh_niu.onnx"
 OUTPUT_SILENCE_RMS_THRESHOLD = 200
+SPEAKER_MIC_SUPPRESSION_TAIL_SECONDS = 0.8
 READY_CHIME_SAMPLE_RATE = 24000
 READY_CHIME_DURATION_SECONDS = 0.25
 READY_CHIME_FREQUENCY_HZ = 880
@@ -600,6 +602,7 @@ class JarvisLive:
         self._last_conversation_activity = 0.0
         self._sleep_after_turn = False
         self._is_speaking   = False
+        self._suppress_mic_until = 0.0
         self._speaking_lock = threading.Lock()
         self._tool_running = False
         self.ui.on_text_command = self._on_text_command
@@ -768,11 +771,18 @@ class JarvisLive:
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
+            was_speaking = self._is_speaking
             self._is_speaking = value
+            if value or was_speaking:
+                self._suppress_mic_until = time.monotonic() + SPEAKER_MIC_SUPPRESSION_TAIL_SECONDS
         if value:
             self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
             self.ui.set_state("LISTENING" if self._conversation_active else "SLEEPING")
+
+    def is_suppressing_mic_for_speaker(self) -> bool:
+        with self._speaking_lock:
+            return self._is_speaking or time.monotonic() < self._suppress_mic_until
 
     def speak(self, text: str):
         if not self._loop or not self.session:
@@ -1158,8 +1168,7 @@ class JarvisLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
-            with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
+            suppress_mic_for_speaker = self.is_suppressing_mic_for_speaker()
             data = indata.tobytes()
 
             if self._conversation_starting and not self.ui.muted:
@@ -1176,7 +1185,7 @@ class JarvisLive:
             if (
                 self._conversation_active
                 and not self._music_sleep_active
-                and not jarvis_speaking
+                and not suppress_mic_for_speaker
                 and not self._tool_running
                 and not self.ui.muted
                 and self.out_queue is not None
