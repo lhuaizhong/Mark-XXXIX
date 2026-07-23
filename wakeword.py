@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import threading
 from pathlib import Path
@@ -7,7 +8,11 @@ import numpy as np
 import sounddevice as sd
 import openwakeword
 from openwakeword.model import Model
-from openwakeword.utils import download_models
+from audio_input import describe_audio_inputs, open_input_stream
+try:
+    from openwakeword.utils import download_models
+except ImportError:
+    download_models = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -22,19 +27,36 @@ FALLBACK_MODEL = "hey_jarvis"
 def build_model(custom_model: str | Path = CUSTOM_MODEL):
     custom_model = Path(custom_model)
     if custom_model.exists():
-        return Model(wakeword_models=[str(custom_model)], inference_framework="onnx")
+        return _load_model([str(custom_model)])
 
     print(
         f"{custom_model.name} not found; using built-in openWakeWord model "
         f"'{FALLBACK_MODEL}'."
     )
-    fallback_model_path = openwakeword.MODELS[FALLBACK_MODEL]["model_path"].replace(
+    available_models = getattr(openwakeword, "MODELS", None) or getattr(
+        openwakeword, "models", {}
+    )
+    if FALLBACK_MODEL not in available_models:
+        raise RuntimeError(
+            f"Built-in openWakeWord model '{FALLBACK_MODEL}' is not available."
+        )
+
+    fallback_model_path = available_models[FALLBACK_MODEL]["model_path"].replace(
         ".tflite", ".onnx"
     )
-    if not os.path.exists(fallback_model_path):
+    if not os.path.exists(fallback_model_path) and download_models:
         download_models([FALLBACK_MODEL])
+    if os.path.exists(fallback_model_path):
+        return _load_model([fallback_model_path])
 
-    return Model(wakeword_models=[FALLBACK_MODEL], inference_framework="onnx")
+    return _load_model([FALLBACK_MODEL])
+
+
+def _load_model(model_paths: list[str]):
+    try:
+        return Model(wakeword_model_paths=model_paths)
+    except TypeError:
+        return Model(wakeword_models=model_paths, inference_framework="onnx")
 
 
 class WakeWordDetector:
@@ -96,7 +118,7 @@ def main():
     detector = WakeWordDetector()
 
     print("Listening for wake word. Press Ctrl+C to stop.")
-    with sd.InputStream(
+    with open_input_stream(
         channels=1,
         samplerate=SAMPLE_RATE,
         blocksize=FRAME_SAMPLES,
@@ -115,3 +137,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("Stopped.")
+    except (RuntimeError, sd.PortAudioError) as exc:
+        print(f"wakeword error: {exc}\nDetected inputs:\n{describe_audio_inputs()}", file=sys.stderr)
+        sys.exit(1)

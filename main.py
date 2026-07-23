@@ -13,6 +13,7 @@ from pathlib import Path
 import sounddevice as sd
 from google import genai
 from google.genai import types
+from audio_input import describe_audio_inputs, open_input_stream
 from ui import JarvisUI
 from wakeword import WakeWordDetector
 from memory.memory_manager import (
@@ -1108,7 +1109,7 @@ class JarvisLive:
                 )
 
         try:
-            with sd.InputStream(
+            with open_input_stream(
                 samplerate=SEND_SAMPLE_RATE,
                 channels=CHANNELS,
                 dtype="int16",
@@ -1120,6 +1121,7 @@ class JarvisLive:
                     await asyncio.sleep(0.1)
         except Exception as e:
             print(f"[JARVIS] ❌ Mic: {e}")
+            print(f"[JARVIS] Audio inputs:\n{describe_audio_inputs()}")
             raise
 
     async def _receive_audio(self):
