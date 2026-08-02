@@ -18,8 +18,7 @@ PULSE_ENV = {
 
 def _pulse_env():
     env = os.environ.copy()
-    for key, value in PULSE_ENV.items():
-        env.setdefault(key, value)
+    env.update(PULSE_ENV)
     return env
 
 
@@ -50,7 +49,31 @@ def get_pulse_source():
     except Exception:
         pass
 
+    for source in list_pulse_sources():
+        if not source.endswith(".monitor"):
+            return source
+
     return DEFAULT_BLUETOOTH_SOURCE
+
+
+def list_pulse_sources():
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "short", "sources"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=_pulse_env(),
+        )
+    except Exception:
+        return []
+
+    sources = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) >= 2:
+            sources.append(fields[1])
+    return sources
 
 
 def describe_audio_inputs():
@@ -191,9 +214,14 @@ class PulseInputStream:
                 time.sleep(0.25)
 
 
-def open_input_stream(*, samplerate, channels, dtype, blocksize, callback=None):
-    device = get_sounddevice_input_device()
-    if device is not None:
+def _open_sounddevice_stream(*, device, samplerate, channels, dtype, blocksize, callback):
+    try:
+        sd.check_input_settings(
+            device=device,
+            samplerate=samplerate,
+            channels=channels,
+            dtype=dtype,
+        )
         return sd.InputStream(
             device=device,
             samplerate=samplerate,
@@ -202,6 +230,23 @@ def open_input_stream(*, samplerate, channels, dtype, blocksize, callback=None):
             blocksize=blocksize,
             callback=callback,
         )
+    except (sd.PortAudioError, ValueError):
+        return None
+
+
+def open_input_stream(*, samplerate, channels, dtype, blocksize, callback=None):
+    device = get_sounddevice_input_device()
+    if device is not None:
+        stream = _open_sounddevice_stream(
+            device=device,
+            samplerate=samplerate,
+            channels=channels,
+            dtype=dtype,
+            blocksize=blocksize,
+            callback=callback,
+        )
+        if stream is not None:
+            return stream
 
     return PulseInputStream(
         samplerate=samplerate,
